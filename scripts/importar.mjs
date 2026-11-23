@@ -12,13 +12,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { montarShell } from "./build.mjs";
 
+// Erros viram anotações do GitHub (legíveis sem abrir o log).
+const falhar = (msg) => { console.log(`::error::${String(msg).replace(/\r?\n/g, " ")}`); process.exit(1); };
+process.on("uncaughtException", falhar);
+process.on("unhandledRejection", falhar);
+
 const TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const CONTA = process.env.CLOUDFLARE_ACCOUNT_ID || "c4ffddd3d16086ee07dd0da898372257";
 const SCRIPT = "central-comex";
-if (!TOKEN) {
-  console.error("Falta o segredo CLOUDFLARE_API_TOKEN no repositório (Settings → Secrets and variables → Actions).");
-  process.exit(1);
-}
+if (!TOKEN) falhar("Falta o segredo CLOUDFLARE_API_TOKEN no repositório (Settings → Secrets and variables → Actions).");
 
 const r = await fetch(
   `https://api.cloudflare.com/client/v4/accounts/${CONTA}/workers/scripts/${SCRIPT}/content/v2`,
