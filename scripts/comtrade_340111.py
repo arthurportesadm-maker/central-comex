@@ -34,7 +34,7 @@ if CHAVE:
 
 # ---------------------------------------------------------------- nomes em português
 PT = Locale("pt", "BR").territories
-AJUSTES = {"HK": "Hong Kong", "MO": "Macau"}
+AJUSTES = {"HK": "Hong Kong", "MO": "Macau", "PS": "Palestina", "AI": "Anguilla", "WF": "Wallis and Futuna Isds"}
 
 
 def nome_pt(iso3, desc):
@@ -149,7 +149,7 @@ for ano in ANO_REF_CANDIDATOS:
     r = valores(comtrade(flowCode="X", partnerCode=0, period=ano))
     al = r.loc[r["reporterCode"] == 276, "US$"]
     print(f"  {ano}: Alemanha = {al.iloc[0] if len(al) else 'sem dado':,}", flush=True)
-    if len(al) and int(al.iloc[0]) == ALEMANHA_PLANILHA:
+    if len(al) and round(al.iloc[0]) == ALEMANHA_PLANILHA:
         ano_ref, exp_rank = ano, r
         break
     if exp_rank is None:
@@ -166,7 +166,7 @@ for _, e in top.iterrows():
     t = tabela_parceiros(d, e["US$"])
     print(f"  {e['reporter']}: {len(t)} destinos", flush=True)
     for _, p in t.iterrows():
-        linhas.append([e["reporter"], p["parceiro"], int(p["US$"]), p["Participação"], int(p["kg"]), p["US$/kg"]])
+        linhas.append([e["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
 destinos = pd.DataFrame(linhas, columns=["Exportador", "País", "US$", "Participação", "kg", "US$/kg"])
 destinos.to_csv(SAIDA / f"exportacao_destinos_{ano_ref}.csv", index=False)
 
@@ -177,6 +177,8 @@ total_imp = imp_rank["US$"].sum()
 imp_tab = imp_rank[["reporter", "US$", "kg"]].rename(columns={"reporter": "País"}).copy()
 imp_tab["Participação"] = imp_tab["US$"] / total_imp
 imp_tab["US$/kg"] = [round(v / k, 2) if k else None for v, k in zip(imp_tab["US$"], imp_tab["kg"])]
+imp_tab["US$"] = imp_tab["US$"].round().astype("int64")
+imp_tab["kg"] = imp_tab["kg"].round().astype("int64")
 imp_tab = imp_tab[["País", "US$", "Participação", "kg", "US$/kg"]]
 imp_tab.to_csv(SAIDA / f"importadores_{ano_ref}.csv", index=False)
 
@@ -188,12 +190,15 @@ for _, m in imp_pareto.iterrows():
     t = tabela_parceiros(d, m["US$"])
     print(f"  {m['reporter']}: {len(t)} fornecedores", flush=True)
     for _, p in t.iterrows():
-        linhas.append([m["reporter"], p["parceiro"], int(p["US$"]), p["Participação"], int(p["kg"]), p["US$/kg"]])
+        linhas.append([m["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
 fornecedores = pd.DataFrame(linhas, columns=["Importador", "País", "US$", "Participação", "kg", "US$/kg"])
 fornecedores.to_csv(SAIDA / f"importacao_fornecedores_{ano_ref}.csv", index=False)
 pd.DataFrame({"chave": ["ano", "paises_pareto", "soma_pareto", "total_mundo"],
               "valor": [ano_ref, n_pareto, int(imp_pareto["US$"].sum()), int(total_imp)]}).to_csv(
     SAIDA / f"importadores_pareto_{ano_ref}.csv", index=False)
+
+if os.environ.get("SO_PLANILHA"):
+    sys.exit(0)
 
 # ---------------------------------------------------------------- 4 e 5. séries históricas
 print("4/5 Séries históricas (importações, exportações do SH e exportações totais)", flush=True)
