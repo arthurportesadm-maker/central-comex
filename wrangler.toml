@@ -1,0 +1,26 @@
+# Configuração do Worker "central-comex" (Central de Comércio Internacional).
+# O deploy é feito pelo GitHub Actions (.github/workflows/deploy.yml) a cada push na main.
+# Os segredos (LOGIN_EMAIL, PASS_HASH, PASS_SALT, SESSION_SECRET) ficam só na Cloudflare
+# e são preservados pelo `wrangler deploy`.
+
+name = "central-comex"
+account_id = "c4ffddd3d16086ee07dd0da898372257"
+main = "dist/worker.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+keep_vars = true
+
+# O código já vem pronto (sem bundler): o build só monta a pasta dist/.
+no_bundle = true
+base_dir = "dist"
+find_additional_modules = true
+
+[[rules]]
+type = "Text"
+globs = ["**/*.txt", "**/*.html"]
+fallthrough = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "central-comex"
+database_id = "8b4ef643-2077-47a8-bcb8-194d46b52380"

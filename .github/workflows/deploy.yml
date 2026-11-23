@@ -1,0 +1,33 @@
+name: Deploy na Cloudflare
+
+# Publica o Worker a cada push na main que mude conteúdo ou código.
+on:
+  push:
+    branches: [main]
+    paths: ["data/**", "src/**", "scripts/build.mjs", "scripts/validar.mjs", "wrangler.toml"]
+  workflow_dispatch:
+
+concurrency: deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Conferir se o código já foi importado
+        id: pronto
+        run: |
+          if [ -f src/worker.js ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "Ainda sem src/: rode o workflow 'Importar da Cloudflare' primeiro."; fi
+      - name: Validar
+        if: steps.pronto.outputs.ok == 'true'
+        run: node scripts/validar.mjs
+      - name: Montar dist/
+        if: steps.pronto.outputs.ok == 'true'
+        run: node scripts/build.mjs
+      - name: Deploy
+        if: steps.pronto.outputs.ok == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx --yes wrangler@4 deploy
