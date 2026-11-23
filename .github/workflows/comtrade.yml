@@ -1,0 +1,34 @@
+name: Dados do Comtrade (SH 340111)
+
+# Roda o script de coleta e faz commit dos resultados em analises/340111/.
+on:
+  push:
+    branches: [main]
+    paths: ["scripts/comtrade_340111.py", ".github/workflows/comtrade.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  coletar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pandas openpyxl requests babel pycountry
+      - name: Coletar
+        env:
+          COMTRADE_KEY: ${{ secrets.COMTRADE_KEY }}
+        run: python scripts/comtrade_340111.py 2>&1 | tee analises.log; test ${PIPESTATUS[0]} -eq 0 || { echo "::error::$(tail -3 analises.log | tr '\n' ' ')"; exit 1; }
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analises
+          git diff --cached --quiet && exit 0
+          git commit -m "Dados do Comtrade para o SH 340111"
+          git pull --rebase -q
+          git push
