@@ -38,7 +38,9 @@ AJUSTES = {"HK": "Hong Kong", "MO": "Macau"}
 
 
 def nome_pt(iso3, desc):
-    c = pycountry.countries.get(alpha_3=iso3 or "")
+    if not isinstance(iso3, str) or len(iso3) != 3:
+        return desc
+    c = pycountry.countries.get(alpha_3=iso3)
     if c:
         return AJUSTES.get(c.alpha_2) or PT.get(c.alpha_2) or desc
     return desc
@@ -48,9 +50,31 @@ def nome_pt(iso3, desc):
 _ultima = [0.0]
 
 
+CACHE = SAIDA / "_cache"
+CACHE.mkdir(exist_ok=True)
+
+
+class CotaEsgotada(RuntimeError):
+    pass
+
+
 def comtrade(**params):
-    """Uma consulta, com intervalo mínimo e novas tentativas no limite de uso (HTTP 429)."""
+    """Uma consulta, com cache em disco (retomável), intervalo mínimo e novas tentativas no 429."""
     params = {"cmdCode": SH, "partner2Code": 0, "motCode": 0, "customsCode": "C00", "includeDesc": "true", **params}
+    chave = "_".join(f"{k}-{params[k]}" for k in sorted(params) if k != "includeDesc").replace(",", "+")
+    arq = CACHE / f"{chave}.csv.gz"
+    if arq.exists():
+        return pd.read_csv(arq)
+    df = _baixar(params)
+    if not df.empty:
+        cols = [c for c in ["reporterCode", "reporterISO", "reporterDesc", "partnerCode", "partnerISO", "partnerDesc",
+                            "period", "primaryValue", "netWgt"] if c in df]
+        df = df[cols]
+    df.to_csv(arq, index=False)
+    return df
+
+
+def _baixar(params):
     for tentativa in range(12):
         espera = 1.8 - (time.time() - _ultima[0])
         if espera > 0:
@@ -67,6 +91,9 @@ def comtrade(**params):
             print(f"  limite de uso; aguardando {seg}s", flush=True)
             time.sleep(seg)
             continue
+        if r.status_code == 403 and "Quota" in r.text:
+            raise CotaEsgotada("Cota diária do Comtrade esgotada; o que já foi baixado ficou no cache. "
+                               "Rode de novo mais tarde ou cadastre o segredo COMTRADE_KEY no GitHub.")
         if r.status_code >= 500:
             time.sleep(5)
             continue
@@ -171,12 +198,16 @@ pd.DataFrame({"chave": ["ano", "paises_pareto", "soma_pareto", "total_mundo"],
 # ---------------------------------------------------------------- 4 e 5. séries históricas
 print("4/5 Séries históricas (importações, exportações do SH e exportações totais)", flush=True)
 imp_serie, exp_sh, exp_tot = [], [], []
-for ano in range(ANO_INI, ANO_FIM + 1):
-    imp_serie.append(valores(comtrade(flowCode="M", partnerCode=0, period=ano)))
-    exp_sh.append(valores(comtrade(flowCode="X", partnerCode=0, period=ano)))
-    exp_tot.append(valores(comtrade(flowCode="X", partnerCode=0, period=ano, cmdCode="TOTAL")))
-    print(f"  {ano}: {len(imp_serie[-1])} importadores, {len(exp_sh[-1])} exportadores, "
-          f"{len(exp_tot[-1])} totais", flush=True)
+anos = list(range(ANO_INI, ANO_FIM + 1))
+# Com chave: até 12 anos por chamada. Sem chave: a prévia devolve no máximo 500 linhas, então um ano por vez.
+lotes = [anos[i:i + 12] for i in range(0, len(anos), 12)] if CHAVE else [[a] for a in anos]
+for lote in lotes:
+    per = ",".join(map(str, lote))
+    imp_serie.append(valores(comtrade(flowCode="M", partnerCode=0, period=per)))
+    exp_sh.append(valores(comtrade(flowCode="X", partnerCode=0, period=per)))
+    exp_tot.append(valores(comtrade(flowCode="X", partnerCode=0, period=per, cmdCode="TOTAL")))
+    print(f"  {per}: {len(imp_serie[-1])} linhas de importação, {len(exp_sh[-1])} de exportação, "
+          f"{len(exp_tot[-1])} de totais", flush=True)
 imp_serie = pd.concat(imp_serie, ignore_index=True)
 exp_sh = pd.concat(exp_sh, ignore_index=True)
 exp_tot = pd.concat(exp_tot, ignore_index=True)
