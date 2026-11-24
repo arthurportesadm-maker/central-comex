@@ -4,10 +4,12 @@ name: Dados do Comtrade (SH 340111)
 on:
   push:
     branches: [main]
-    paths: ["scripts/comtrade_340111.py", ".github/workflows/comtrade.yml"]
+    paths: ["scripts/comtrade_340111.py", ".github/workflows/comtrade.yml", ".coletar"]
   workflow_dispatch:
   schedule:
-    - cron: "17 9 * * 1"   # segundas, 06h17 em Brasília: atualiza séries e VCR (só anos recentes)
+    - cron: "17 9 * * *"   # todo dia, 06h17 em Brasília: completa o que faltar e renova os anos recentes
+
+concurrency: comtrade
 
 permissions:
   contents: write
@@ -24,7 +26,6 @@ jobs:
       - name: Coletar
         env:
           COMTRADE_KEY: ${{ secrets.COMTRADE_KEY }}
-          SO_SERIES: ${{ github.event_name == 'schedule' && '1' || '' }}
         run: python scripts/comtrade_340111.py 2>&1 | tee analises.log; test ${PIPESTATUS[0]} -eq 0 || { echo "::error::$(tail -3 analises.log | tr '\n' ' ')"; exit 1; }
       - name: Commit (inclusive cache parcial, para a próxima rodada retomar)
         if: always()

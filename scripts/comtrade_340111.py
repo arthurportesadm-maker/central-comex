@@ -1,12 +1,15 @@
-"""Puxa dados do UN Comtrade para o SH 340111 (sabões de toucador) e monta:
+"""Puxa dados do UN Comtrade para o SH 340111 (sabões de toucador), últimos 10 anos, e monta:
 
-1. Exportação: destinos dos 19 maiores exportadores (mesmo formato da aba "Exportação" da planilha).
-2. Importação: ranking de importadores e fornecedores dos importadores do Pareto (80%).
-3. Série histórica de importações por país (Excel).
-4. VCR (índice de Balassa) de todos os países ao longo do tempo (Excel).
+- Exportações e importações por país (Paretos de 80% + Brasil), ano a ano.
+- Destinos de cada exportador do Pareto (+ Brasil), ano a ano.
+- Fornecedores de cada importador do Pareto (+ Brasil), ano a ano.
+- VCR (índice de Balassa) dos países dos Paretos (+ Brasil), ano a ano.
+- Tabelas do ano de referência para a planilha do Google (formato das abas Exportação/Importadores/Importação).
 
-Roda no GitHub Actions (.github/workflows/comtrade.yml), porque a API precisa de internet aberta.
-Saída em analises/340111/. Fonte: UN Comtrade, API pública (preview) ou com chave (COMTRADE_KEY).
+Roda no GitHub Actions (.github/workflows/comtrade.yml): a API precisa de internet aberta.
+Tudo fica em cache (analises/340111/_cache): cada rodada só baixa o que falta ou expirou.
+Se a cota diária da API pública acabar, o Excel sai com o que houver e a próxima rodada continua.
+Fonte: UN Comtrade, API pública (preview) ou com chave (segredo COMTRADE_KEY).
 """
 import os
 import sys
@@ -19,13 +22,12 @@ import requests
 from babel import Locale
 
 SH = "340111"
-ANO_INI = 2000
-ANO_FIM = int(time.strftime("%Y"))           # inclui o ano corrente (parcial)
-ANOS_RECENTES = 3                            # anos que os países ainda revisam: rebaixados a cada 7 dias
-SO_SERIES = bool(os.environ.get("SO_SERIES"))  # rodada semanal: só séries e VCR (pula as tabelas da planilha)
-ANO_REF_CANDIDATOS = [2025, 2024]          # ano da planilha: o que reproduz Alemanha = 480.234.020
-ALEMANHA_PLANILHA = 480_234_020
-TOP_EXPORTADORES = 19
+ANO_FIM = int(time.strftime("%Y")) - 1      # último ano fechado (o corrente ainda não tem dados)
+ANOS = list(range(ANO_FIM - 9, ANO_FIM + 1)) # últimos 10 anos
+ANO_REF = ANO_FIM                            # ano que define os Paretos (o da planilha)
+ANOS_RECENTES = 3                            # anos que os países ainda revisam
+VALIDADE_RECENTES = 28 * 86400               # ...rebaixados a cada 4 semanas
+BRASIL = 76
 SAIDA = Path("analises/340111")
 SAIDA.mkdir(parents=True, exist_ok=True)
 
@@ -61,6 +63,9 @@ class CotaEsgotada(RuntimeError):
     pass
 
 
+COTA = [False]   # vira True quando a cota acaba: dali em diante só o cache é usado
+
+
 def comtrade(**params):
     """Uma consulta, com cache em disco (retomável), intervalo mínimo e novas tentativas no 429."""
     params = {"cmdCode": SH, "partner2Code": 0, "motCode": 0, "customsCode": "C00", "includeDesc": "true", **params}
@@ -68,12 +73,22 @@ def comtrade(**params):
     arq = CACHE / f"{chave}.csv.gz"
     anos_pedidos = [int(a) for a in str(params.get("period", "")).split(",") if a.strip().isdigit()]
     recente = any(a > ANO_FIM - ANOS_RECENTES for a in anos_pedidos)
-    if arq.exists() and not (recente and time.time() - arq.stat().st_mtime > 7 * 86400):
+    def ler():
         try:
             return pd.read_csv(arq)
         except pd.errors.EmptyDataError:   # ano ainda sem dados no Comtrade
             return pd.DataFrame()
-    df = _baixar(params)
+    vencido = recente and time.time() - arq.stat().st_mtime > VALIDADE_RECENTES if arq.exists() else True
+    if arq.exists() and (not vencido or COTA[0]):
+        return ler()                        # válido, ou vencido mas sem cota para renovar
+    if COTA[0]:
+        raise CotaEsgotada("cota esgotada")
+    try:
+        df = _baixar(params)
+    except CotaEsgotada:
+        if arq.exists():
+            return ler()
+        raise
     if not df.empty:
         cols = [c for c in ["reporterCode", "reporterISO", "reporterDesc", "partnerCode", "partnerISO", "partnerDesc",
                             "period", "primaryValue", "netWgt"] if c in df]
@@ -100,6 +115,7 @@ def _baixar(params):
             time.sleep(seg)
             continue
         if r.status_code == 403 and "Quota" in r.text:
+            COTA[0] = True
             raise CotaEsgotada("Cota diária do Comtrade esgotada; o que já foi baixado ficou no cache. "
                                "Rode de novo mais tarde ou cadastre o segredo COMTRADE_KEY no GitHub.")
         if r.status_code >= 500:
@@ -152,86 +168,77 @@ def pareto(df, corte=0.80):
     return d.head(n), n
 
 
-ano_ref = None
-if not SO_SERIES:
-    # ---------------------------------------------------------------- 1. ano de referência
-    print("1/5 Ranking de exportadores e ano de referência", flush=True)
-    ano_ref, exp_rank = None, None
-    for ano in ANO_REF_CANDIDATOS:
-        r = valores(comtrade(flowCode="X", partnerCode=0, period=ano))
-        al = r.loc[r["reporterCode"] == 276, "US$"]
-        print(f"  {ano}: Alemanha = {al.iloc[0] if len(al) else 'sem dado':,}", flush=True)
-        if len(al) and round(al.iloc[0]) == ALEMANHA_PLANILHA:
-            ano_ref, exp_rank = ano, r
-            break
-        if exp_rank is None:
-            ano_ref, exp_rank = ano, r
-    print(f"  ano de referência: {ano_ref}", flush=True)
-    exp_rank = exp_rank.sort_values("US$", ascending=False)
-    top = exp_rank.head(TOP_EXPORTADORES)
 
-    # ---------------------------------------------------------------- 2. destinos dos exportadores
-    print("2/5 Destinos dos 19 maiores exportadores", flush=True)
+def tentar(**params):
+    """Como comtrade(), mas devolve None se a cota acabou (para seguir com o que houver)."""
+    try:
+        return valores(comtrade(**params))
+    except CotaEsgotada:
+        FALTANDO.append(params)
+        return None
+
+
+FALTANDO = []
+
+# ---------------------------------------------------------------- 1. totais por país (todos os países, 10 anos)
+print(f"1/4 Totais por país {ANOS[0]}–{ANOS[-1]}", flush=True)
+exp_sh, imp_sh, exp_tot = [], [], []
+for ano in ANOS:
+    for lst, kw in ((exp_sh, dict(flowCode="X")), (imp_sh, dict(flowCode="M")), (exp_tot, dict(flowCode="X", cmdCode="TOTAL"))):
+        d = tentar(partnerCode=0, period=ano, **kw)
+        if d is not None:
+            lst.append(d)
+exp_sh, imp_sh, exp_tot = (pd.concat(x, ignore_index=True) for x in (exp_sh, imp_sh, exp_tot))
+
+# ---------------------------------------------------------------- 2. Paretos do ano de referência (+ Brasil)
+exp_ref = exp_sh[exp_sh["ano"] == ANO_REF]
+imp_ref = imp_sh[imp_sh["ano"] == ANO_REF]
+if exp_ref.empty or imp_ref.empty:
+    sys.exit(f"Sem dados de {ANO_REF} para definir os Paretos.")
+exp_par, n_exp = pareto(exp_ref)
+imp_par, n_imp = pareto(imp_ref)
+nomes = dict(zip(pd.concat([exp_sh, imp_sh])["reporterCode"], pd.concat([exp_sh, imp_sh])["reporter"]))
+exportadores = list(exp_par["reporterCode"]) + ([BRASIL] if BRASIL not in set(exp_par["reporterCode"]) else [])
+importadores = list(imp_par["reporterCode"]) + ([BRASIL] if BRASIL not in set(imp_par["reporterCode"]) else [])
+print(f"2/4 Pareto {ANO_REF}: {n_exp} exportadores, {n_imp} importadores (+ Brasil onde faltar)", flush=True)
+
+# ---------------------------------------------------------------- 3. destinos e fornecedores, ano a ano
+print("3/4 Destinos e fornecedores (do ano mais recente para o mais antigo)", flush=True)
+
+
+def parceiros(fluxo, reporters, totais):
     linhas = []
-    for _, e in top.iterrows():
-        d = valores(comtrade(flowCode="X", reporterCode=int(e["reporterCode"]), period=ano_ref))
-        t = tabela_parceiros(d, e["US$"])
-        print(f"  {e['reporter']}: {len(t)} destinos", flush=True)
-        for _, p in t.iterrows():
-            linhas.append([e["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
-    destinos = pd.DataFrame(linhas, columns=["Exportador", "País", "US$", "Participação", "kg", "US$/kg"])
-    destinos.to_csv(SAIDA / f"exportacao_destinos_{ano_ref}.csv", index=False)
+    for ano in sorted(ANOS, reverse=True):
+        for rc in reporters:
+            d = tentar(flowCode=fluxo, reporterCode=int(rc), period=ano)
+            if d is None or d.empty:
+                continue
+            tot = totais.loc[(totais["reporterCode"] == rc) & (totais["ano"] == ano), "US$"]
+            t = tabela_parceiros(d, tot.iloc[0] if len(tot) and tot.iloc[0] else d.loc[d["partnerCode"] != 0, "US$"].sum())
+            t["ano"] = ano
+            t["reporter"] = nomes.get(rc, t["reporter"].iloc[0])
+            linhas.append(t)
+        print(f"  {fluxo} {ano}: ok", flush=True)
+    if not linhas:
+        return pd.DataFrame(columns=["Ano", "País", "Parceiro", "US$", "Participação", "kg", "US$/kg"])
+    t = pd.concat(linhas, ignore_index=True)
+    t["US$"] = t["US$"].round().astype("int64")
+    t["kg"] = t["kg"].round().astype("int64")
+    return t.rename(columns={"ano": "Ano", "reporter": "País", "parceiro": "Parceiro"})[
+        ["Ano", "País", "Parceiro", "US$", "Participação", "kg", "US$/kg"]]
 
-    # ---------------------------------------------------------------- 3. importadores e fornecedores
-    print("3/5 Importadores e fornecedores", flush=True)
-    imp_rank = valores(comtrade(flowCode="M", partnerCode=0, period=ano_ref)).sort_values("US$", ascending=False)
-    total_imp = imp_rank["US$"].sum()
-    imp_tab = imp_rank[["reporter", "US$", "kg"]].rename(columns={"reporter": "País"}).copy()
-    imp_tab["Participação"] = imp_tab["US$"] / total_imp
-    imp_tab["US$/kg"] = [round(v / k, 2) if k else None for v, k in zip(imp_tab["US$"], imp_tab["kg"])]
-    imp_tab["US$"] = imp_tab["US$"].round().astype("int64")
-    imp_tab["kg"] = imp_tab["kg"].round().astype("int64")
-    imp_tab = imp_tab[["País", "US$", "Participação", "kg", "US$/kg"]]
-    imp_tab.to_csv(SAIDA / f"importadores_{ano_ref}.csv", index=False)
 
-    imp_pareto, n_pareto = pareto(imp_rank)
-    print(f"  Pareto de importadores: {n_pareto} países", flush=True)
-    linhas = []
-    for _, m in imp_pareto.iterrows():
-        d = valores(comtrade(flowCode="M", reporterCode=int(m["reporterCode"]), period=ano_ref))
-        t = tabela_parceiros(d, m["US$"])
-        print(f"  {m['reporter']}: {len(t)} fornecedores", flush=True)
-        for _, p in t.iterrows():
-            linhas.append([m["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
-    fornecedores = pd.DataFrame(linhas, columns=["Importador", "País", "US$", "Participação", "kg", "US$/kg"])
-    fornecedores.to_csv(SAIDA / f"importacao_fornecedores_{ano_ref}.csv", index=False)
-    pd.DataFrame({"chave": ["ano", "paises_pareto", "soma_pareto", "total_mundo"],
-                  "valor": [ano_ref, n_pareto, int(imp_pareto["US$"].sum()), int(total_imp)]}).to_csv(
-        SAIDA / f"importadores_pareto_{ano_ref}.csv", index=False)
+destinos = parceiros("X", exportadores, exp_sh)
+fornecedores = parceiros("M", importadores, imp_sh)
 
-if os.environ.get("SO_PLANILHA"):
-    sys.exit(0)
+# tabelas do ano de referência para a planilha do Google
+for t, nome, col in ((destinos, "exportacao_destinos", "Exportador"), (fornecedores, "importacao_fornecedores", "Importador")):
+    r = t[t["Ano"] == ANO_REF].drop(columns="Ano").rename(columns={"País": col, "Parceiro": "País"})
+    if len(r):
+        r.to_csv(SAIDA / f"{nome}_{ANO_REF}.csv", index=False)
 
-# ---------------------------------------------------------------- 4 e 5. séries históricas
-print("4/5 Séries históricas (importações, exportações do SH e exportações totais)", flush=True)
-imp_serie, exp_sh, exp_tot = [], [], []
-anos = list(range(ANO_INI, ANO_FIM + 1))
-# Com chave: até 12 anos por chamada. Sem chave: a prévia devolve no máximo 500 linhas, então um ano por vez.
-lotes = [anos[i:i + 12] for i in range(0, len(anos), 12)] if CHAVE else [[a] for a in anos]
-for lote in lotes:
-    per = ",".join(map(str, lote))
-    imp_serie.append(valores(comtrade(flowCode="M", partnerCode=0, period=per)))
-    exp_sh.append(valores(comtrade(flowCode="X", partnerCode=0, period=per)))
-    exp_tot.append(valores(comtrade(flowCode="X", partnerCode=0, period=per, cmdCode="TOTAL")))
-    print(f"  {per}: {len(imp_serie[-1])} linhas de importação, {len(exp_sh[-1])} de exportação, "
-          f"{len(exp_tot[-1])} de totais", flush=True)
-imp_serie = pd.concat(imp_serie, ignore_index=True)
-exp_sh = pd.concat(exp_sh, ignore_index=True)
-exp_tot = pd.concat(exp_tot, ignore_index=True)
-
-print("5/5 VCR e Excel", flush=True)
-# VCR_i,t = (X_i,SH / X_i,total) / (X_mundo,SH / X_mundo,total)
-# Mundo = soma dos países que reportaram AS DUAS séries no ano (mesma base no numerador e no denominador).
+# ---------------------------------------------------------------- 4. VCR e Excel
+print("4/4 VCR e Excel", flush=True)
 base = exp_sh[["reporterCode", "reporter", "ano", "US$"]].rename(columns={"US$": "X_SH"}).merge(
     exp_tot[["reporterCode", "ano", "US$"]].rename(columns={"US$": "X_total"}), on=["reporterCode", "ano"], how="inner")
 base = base[base["X_total"] > 0]
@@ -240,60 +247,105 @@ vcr = base.merge(mundo, on="ano")
 vcr["Part. no SH (país)"] = vcr["X_SH"] / vcr["X_total"]
 vcr["Part. no SH (mundo)"] = vcr["Xmundo_SH"] / vcr["Xmundo_total"]
 vcr["VCR"] = vcr["Part. no SH (país)"] / vcr["Part. no SH (mundo)"]
-vcr = vcr.sort_values(["ano", "VCR"], ascending=[True, False])
+paises_vcr = list(dict.fromkeys(exportadores + importadores))
+vcr = vcr[vcr["reporterCode"].isin(paises_vcr)]
 
-vcr_wide = vcr.pivot_table(index="reporter", columns="ano", values="VCR")
-vcr_wide = vcr_wide.loc[vcr_wide[vcr_wide.columns.max()].sort_values(ascending=False, na_position="last").index]
-imp_wide = imp_serie.pivot_table(index="reporter", columns="ano", values="US$", aggfunc="sum")
-imp_wide = imp_wide.loc[imp_wide.sum(axis=1).sort_values(ascending=False).index]
-imp_share = imp_wide / imp_wide.sum()
+
+def serie(df, codigos):
+    d = df[df["reporterCode"].isin(codigos)]
+    w = d.pivot_table(index="reporter", columns="ano", values="US$", aggfunc="sum").reindex(columns=ANOS)
+    return w.reindex([nomes[c] for c in codigos if c in nomes])
+
+
+exp_w = serie(exp_sh, exportadores)
+imp_w = serie(imp_sh, importadores)
+exp_pct = exp_w / exp_sh.groupby("ano")["US$"].sum().reindex(ANOS)
+imp_pct = imp_w / imp_sh.groupby("ano")["US$"].sum().reindex(ANOS)
+vcr_w = vcr.pivot_table(index="reporter", columns="ano", values="VCR").reindex(columns=ANOS)
+vcr_w = vcr_w.reindex([nomes[c] for c in paises_vcr if c in nomes and nomes[c] in vcr_w.index])
+
+
+def parceiros_largo(t, valor, ordem_paises):
+    if t.empty:
+        return pd.DataFrame()
+    w = t.pivot_table(index=["País", "Parceiro"], columns="Ano", values=valor, aggfunc="sum").reindex(columns=ANOS)
+    ult = t[t["Ano"] == t["Ano"].max()].set_index(["País", "Parceiro"])["US$"]
+    w["_ord_p"] = [ordem_paises.index(p) if p in ordem_paises else 999 for p in w.index.get_level_values(0)]
+    w["_ord_v"] = -ult.reindex(w.index).fillna(0)
+    w = w.sort_values(["_ord_p", "_ord_v"]).drop(columns=["_ord_p", "_ord_v"])
+    return w
+
+
+ordem_exp = [nomes[c] for c in exportadores if c in nomes]
+ordem_imp = [nomes[c] for c in importadores if c in nomes]
+esperado = len(ANOS) * (len(exportadores) + len(importadores))
+obtido = destinos.groupby(["Ano", "País"]).ngroups + fornecedores.groupby(["Ano", "País"]).ngroups
+completo = not FALTANDO
 
 nota = [
     ["Produto", f"SH {SH}: sabões, produtos e preparações tensoativos de toucador (inclusive de uso medicinal)"],
-    ["Fonte", "UN Comtrade (ONU), " + ("API com chave /data/v1/get" if CHAVE else "API pública /public/v1/preview") +
-     ", dados anuais em US$ (primaryValue), valores declarados pelos países que reportam."],
-    ["Extraído em", time.strftime("%d/%m/%Y")],
-    ["Importações", "Série por país importador, parceiro = Mundo. Células vazias = país não reportou naquele ano. "
-                    "Anos recentes podem estar incompletos (países ainda reportando)."],
-    ["VCR", "Índice de Balassa: (X do país no SH / X total do país) ÷ (X mundial no SH / X total mundial). "
-            "Mundo = soma dos países que reportaram as duas séries no ano. VCR > 1 = vantagem comparativa revelada."],
-    ["Atualização", f"Semanal (GitHub Actions). Anos anteriores a {ANO_FIM - ANOS_RECENTES + 1} ficam em cache; "
-                    f"os {ANOS_RECENTES} mais recentes são baixados de novo a cada 7 dias."],
+    ["Período", f"{ANOS[0]}–{ANOS[-1]} (últimos 10 anos fechados). Anos recentes podem estar incompletos: "
+                "alguns países ainda não reportaram."],
+    ["Países", f"Pareto de {ANO_REF} (menor grupo que soma 80% do total): {n_exp} exportadores e {n_imp} importadores, "
+               "mais o Brasil onde ele não estiver. VCR: união dos dois grupos."],
+    ["Fonte", "UN Comtrade (ONU), " + ("API com chave" if CHAVE else "API pública") +
+     ". US$ correntes (primaryValue) e kg (netWgt) declarados pelo país que reporta."],
+    ["Destinos", "Exportações declaradas pelo exportador, por país de destino. Participação = % do total exportado "
+                 "pelo exportador no ano."],
+    ["Fornecedores", "Importações declaradas pelo importador, por país de origem. Participação = % do total importado "
+                     "pelo mercado no ano."],
+    ["VCR", "(X do país no SH / X total do país) ÷ (X mundial no SH / X total mundial); mundo = soma dos países que "
+            "reportaram as duas séries no ano. VCR > 1 = vantagem comparativa revelada."],
+    ["Atualização", "Semanal (GitHub Actions); anos antigos ficam em cache, os 3 mais recentes são baixados de novo "
+                    "a cada 4 semanas. Extraído em " + time.strftime("%d/%m/%Y") + "."],
+    ["Status", "Completo." if completo else
+     f"INCOMPLETO: a cota diária da API pública acabou; faltam {len(FALTANDO)} consultas "
+     f"({obtido} de {esperado} combinações país × ano de destinos/fornecedores). A próxima rodada continua."],
 ]
 
 arq = SAIDA / f"comtrade_{SH}_series.xlsx"
 with pd.ExcelWriter(arq, engine="openpyxl") as xw:
-    imp_wide.to_excel(xw, sheet_name="Importações US$")
-    imp_share.to_excel(xw, sheet_name="Importações % mundo")
-    vcr_wide.to_excel(xw, sheet_name="VCR por ano")
-    vcr[["ano", "reporter", "X_SH", "X_total", "Xmundo_SH", "Xmundo_total", "Part. no SH (país)",
-         "Part. no SH (mundo)", "VCR"]].rename(columns={"reporter": "País"}).to_excel(
-        xw, sheet_name="VCR (dados)", index=False)
-    imp_serie[["ano", "reporter", "US$", "kg"]].rename(columns={"reporter": "País"}).sort_values(
-        ["ano", "US$"], ascending=[True, False]).to_excel(xw, sheet_name="Importações (dados)", index=False)
     pd.DataFrame(nota, columns=["Item", "Descrição"]).to_excel(xw, sheet_name="Notas", index=False)
+    exp_w.rename_axis("Exportador").to_excel(xw, sheet_name="Exportações US$")
+    exp_pct.rename_axis("Exportador").to_excel(xw, sheet_name="Exportações % mundo")
+    imp_w.rename_axis("Importador").to_excel(xw, sheet_name="Importações US$")
+    imp_pct.rename_axis("Importador").to_excel(xw, sheet_name="Importações % mundo")
+    vcr_w.rename_axis("País").to_excel(xw, sheet_name="VCR")
+    parceiros_largo(destinos, "US$", ordem_exp).rename_axis(["Exportador", "Destino"]).to_excel(xw, sheet_name="Destinos US$")
+    parceiros_largo(destinos, "Participação", ordem_exp).rename_axis(["Exportador", "Destino"]).to_excel(xw, sheet_name="Destinos %")
+    parceiros_largo(fornecedores, "US$", ordem_imp).rename_axis(["Importador", "Fornecedor"]).to_excel(xw, sheet_name="Fornecedores US$")
+    parceiros_largo(fornecedores, "Participação", ordem_imp).rename_axis(["Importador", "Fornecedor"]).to_excel(xw, sheet_name="Fornecedores %")
+    destinos.rename(columns={"País": "Exportador", "Parceiro": "Destino"}).to_excel(xw, sheet_name="Destinos (dados)", index=False)
+    fornecedores.rename(columns={"País": "Importador", "Parceiro": "Fornecedor"}).to_excel(xw, sheet_name="Fornecedores (dados)", index=False)
+    vcr[["ano", "reporter", "X_SH", "X_total", "Xmundo_SH", "Xmundo_total", "Part. no SH (país)", "Part. no SH (mundo)",
+         "VCR"]].rename(columns={"ano": "Ano", "reporter": "País"}).to_excel(xw, sheet_name="VCR (dados)", index=False)
 
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Alignment, Font, PatternFill
     cab = PatternFill("solid", fgColor="1F4FA3")
     for ws in xw.book.worksheets:
-        ws.freeze_panes = "B2"
+        largo_idx = ws.title in ("Destinos US$", "Destinos %", "Fornecedores US$", "Fornecedores %")
+        ws.freeze_panes = "C2" if largo_idx else "B2"
         for c in ws[1]:
             c.font = Font(bold=True, color="FFFFFF")
             c.fill = cab
             c.alignment = Alignment(horizontal="center")
-        ws.column_dimensions["A"].width = 30
+        ws.column_dimensions["A"].width = 24
+        ws.column_dimensions["B"].width = 24 if largo_idx or "(dados)" in ws.title else 14
+        pct = "%" in ws.title
         for col in ws.iter_cols(min_col=2, max_col=ws.max_column, min_row=2):
-            letra = col[0].column_letter
-            ws.column_dimensions[letra].width = 14
             titulo = str(ws.cell(row=1, column=col[0].column).value)
-            fmt = ("0.00" if ws.title == "VCR por ano" or titulo == "VCR"
-                   else "0.00%" if ws.title == "Importações % mundo" or titulo.startswith("Part.")
-                   else "#,##0" if titulo not in ("ano",) else "0")
+            if col[0].column > 2 or not largo_idx:
+                ws.column_dimensions[col[0].column_letter].width = max(ws.column_dimensions[col[0].column_letter].width or 0, 13)
+            fmt = ("0" if titulo == "Ano" else "0.00" if ws.title == "VCR" or titulo in ("VCR", "US$/kg")
+                   else "0.00%" if pct or titulo.startswith("Part") else "#,##0")
             for c in col:
                 if isinstance(c.value, (int, float)):
                     c.number_format = fmt
-    notas = xw.book["Notas"]
-    notas.column_dimensions["B"].width = 120
-    notas.freeze_panes = None
+    xw.book["Notas"].column_dimensions["B"].width = 130
+    xw.book["Notas"].freeze_panes = None
 
-print(f"OK: {arq} ({len(imp_wide)} importadores, {len(vcr_wide)} países com VCR, {ANO_INI}–{ANO_FIM})", flush=True)
+msg = (f"OK: {arq} | {len(ANOS)} anos, {len(exportadores)} exportadores, {len(importadores)} importadores, "
+       f"{len(vcr_w)} países com VCR | destinos/fornecedores: {obtido}/{esperado}")
+print(msg, flush=True)
+if not completo:
+    print(f"::warning::INCOMPLETO ({obtido}/{esperado}); faltam {len(FALTANDO)} consultas. A próxima rodada continua do cache.")
