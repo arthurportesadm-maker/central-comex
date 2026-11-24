@@ -19,7 +19,10 @@ import requests
 from babel import Locale
 
 SH = "340111"
-ANO_INI, ANO_FIM = 2000, 2025
+ANO_INI = 2000
+ANO_FIM = int(time.strftime("%Y"))           # inclui o ano corrente (parcial)
+ANOS_RECENTES = 3                            # anos que os países ainda revisam: rebaixados a cada 7 dias
+SO_SERIES = bool(os.environ.get("SO_SERIES"))  # rodada semanal: só séries e VCR (pula as tabelas da planilha)
 ANO_REF_CANDIDATOS = [2025, 2024]          # ano da planilha: o que reproduz Alemanha = 480.234.020
 ALEMANHA_PLANILHA = 480_234_020
 TOP_EXPORTADORES = 19
@@ -63,7 +66,9 @@ def comtrade(**params):
     params = {"cmdCode": SH, "partner2Code": 0, "motCode": 0, "customsCode": "C00", "includeDesc": "true", **params}
     chave = "_".join(f"{k}-{params[k]}" for k in sorted(params) if k != "includeDesc").replace(",", "+")
     arq = CACHE / f"{chave}.csv.gz"
-    if arq.exists():
+    anos_pedidos = [int(a) for a in str(params.get("period", "")).split(",") if a.strip().isdigit()]
+    recente = any(a > ANO_FIM - ANOS_RECENTES for a in anos_pedidos)
+    if arq.exists() and not (recente and time.time() - arq.stat().st_mtime > 7 * 86400):
         return pd.read_csv(arq)
     df = _baixar(params)
     if not df.empty:
@@ -142,60 +147,62 @@ def pareto(df, corte=0.80):
     return d.head(n), n
 
 
-# ---------------------------------------------------------------- 1. ano de referência
-print("1/5 Ranking de exportadores e ano de referência", flush=True)
-ano_ref, exp_rank = None, None
-for ano in ANO_REF_CANDIDATOS:
-    r = valores(comtrade(flowCode="X", partnerCode=0, period=ano))
-    al = r.loc[r["reporterCode"] == 276, "US$"]
-    print(f"  {ano}: Alemanha = {al.iloc[0] if len(al) else 'sem dado':,}", flush=True)
-    if len(al) and round(al.iloc[0]) == ALEMANHA_PLANILHA:
-        ano_ref, exp_rank = ano, r
-        break
-    if exp_rank is None:
-        ano_ref, exp_rank = ano, r
-print(f"  ano de referência: {ano_ref}", flush=True)
-exp_rank = exp_rank.sort_values("US$", ascending=False)
-top = exp_rank.head(TOP_EXPORTADORES)
+ano_ref = None
+if not SO_SERIES:
+    # ---------------------------------------------------------------- 1. ano de referência
+    print("1/5 Ranking de exportadores e ano de referência", flush=True)
+    ano_ref, exp_rank = None, None
+    for ano in ANO_REF_CANDIDATOS:
+        r = valores(comtrade(flowCode="X", partnerCode=0, period=ano))
+        al = r.loc[r["reporterCode"] == 276, "US$"]
+        print(f"  {ano}: Alemanha = {al.iloc[0] if len(al) else 'sem dado':,}", flush=True)
+        if len(al) and round(al.iloc[0]) == ALEMANHA_PLANILHA:
+            ano_ref, exp_rank = ano, r
+            break
+        if exp_rank is None:
+            ano_ref, exp_rank = ano, r
+    print(f"  ano de referência: {ano_ref}", flush=True)
+    exp_rank = exp_rank.sort_values("US$", ascending=False)
+    top = exp_rank.head(TOP_EXPORTADORES)
 
-# ---------------------------------------------------------------- 2. destinos dos exportadores
-print("2/5 Destinos dos 19 maiores exportadores", flush=True)
-linhas = []
-for _, e in top.iterrows():
-    d = valores(comtrade(flowCode="X", reporterCode=int(e["reporterCode"]), period=ano_ref))
-    t = tabela_parceiros(d, e["US$"])
-    print(f"  {e['reporter']}: {len(t)} destinos", flush=True)
-    for _, p in t.iterrows():
-        linhas.append([e["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
-destinos = pd.DataFrame(linhas, columns=["Exportador", "País", "US$", "Participação", "kg", "US$/kg"])
-destinos.to_csv(SAIDA / f"exportacao_destinos_{ano_ref}.csv", index=False)
+    # ---------------------------------------------------------------- 2. destinos dos exportadores
+    print("2/5 Destinos dos 19 maiores exportadores", flush=True)
+    linhas = []
+    for _, e in top.iterrows():
+        d = valores(comtrade(flowCode="X", reporterCode=int(e["reporterCode"]), period=ano_ref))
+        t = tabela_parceiros(d, e["US$"])
+        print(f"  {e['reporter']}: {len(t)} destinos", flush=True)
+        for _, p in t.iterrows():
+            linhas.append([e["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
+    destinos = pd.DataFrame(linhas, columns=["Exportador", "País", "US$", "Participação", "kg", "US$/kg"])
+    destinos.to_csv(SAIDA / f"exportacao_destinos_{ano_ref}.csv", index=False)
 
-# ---------------------------------------------------------------- 3. importadores e fornecedores
-print("3/5 Importadores e fornecedores", flush=True)
-imp_rank = valores(comtrade(flowCode="M", partnerCode=0, period=ano_ref)).sort_values("US$", ascending=False)
-total_imp = imp_rank["US$"].sum()
-imp_tab = imp_rank[["reporter", "US$", "kg"]].rename(columns={"reporter": "País"}).copy()
-imp_tab["Participação"] = imp_tab["US$"] / total_imp
-imp_tab["US$/kg"] = [round(v / k, 2) if k else None for v, k in zip(imp_tab["US$"], imp_tab["kg"])]
-imp_tab["US$"] = imp_tab["US$"].round().astype("int64")
-imp_tab["kg"] = imp_tab["kg"].round().astype("int64")
-imp_tab = imp_tab[["País", "US$", "Participação", "kg", "US$/kg"]]
-imp_tab.to_csv(SAIDA / f"importadores_{ano_ref}.csv", index=False)
+    # ---------------------------------------------------------------- 3. importadores e fornecedores
+    print("3/5 Importadores e fornecedores", flush=True)
+    imp_rank = valores(comtrade(flowCode="M", partnerCode=0, period=ano_ref)).sort_values("US$", ascending=False)
+    total_imp = imp_rank["US$"].sum()
+    imp_tab = imp_rank[["reporter", "US$", "kg"]].rename(columns={"reporter": "País"}).copy()
+    imp_tab["Participação"] = imp_tab["US$"] / total_imp
+    imp_tab["US$/kg"] = [round(v / k, 2) if k else None for v, k in zip(imp_tab["US$"], imp_tab["kg"])]
+    imp_tab["US$"] = imp_tab["US$"].round().astype("int64")
+    imp_tab["kg"] = imp_tab["kg"].round().astype("int64")
+    imp_tab = imp_tab[["País", "US$", "Participação", "kg", "US$/kg"]]
+    imp_tab.to_csv(SAIDA / f"importadores_{ano_ref}.csv", index=False)
 
-imp_pareto, n_pareto = pareto(imp_rank)
-print(f"  Pareto de importadores: {n_pareto} países", flush=True)
-linhas = []
-for _, m in imp_pareto.iterrows():
-    d = valores(comtrade(flowCode="M", reporterCode=int(m["reporterCode"]), period=ano_ref))
-    t = tabela_parceiros(d, m["US$"])
-    print(f"  {m['reporter']}: {len(t)} fornecedores", flush=True)
-    for _, p in t.iterrows():
-        linhas.append([m["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
-fornecedores = pd.DataFrame(linhas, columns=["Importador", "País", "US$", "Participação", "kg", "US$/kg"])
-fornecedores.to_csv(SAIDA / f"importacao_fornecedores_{ano_ref}.csv", index=False)
-pd.DataFrame({"chave": ["ano", "paises_pareto", "soma_pareto", "total_mundo"],
-              "valor": [ano_ref, n_pareto, int(imp_pareto["US$"].sum()), int(total_imp)]}).to_csv(
-    SAIDA / f"importadores_pareto_{ano_ref}.csv", index=False)
+    imp_pareto, n_pareto = pareto(imp_rank)
+    print(f"  Pareto de importadores: {n_pareto} países", flush=True)
+    linhas = []
+    for _, m in imp_pareto.iterrows():
+        d = valores(comtrade(flowCode="M", reporterCode=int(m["reporterCode"]), period=ano_ref))
+        t = tabela_parceiros(d, m["US$"])
+        print(f"  {m['reporter']}: {len(t)} fornecedores", flush=True)
+        for _, p in t.iterrows():
+            linhas.append([m["reporter"], p["parceiro"], round(p["US$"]), p["Participação"], round(p["kg"]), p["US$/kg"]])
+    fornecedores = pd.DataFrame(linhas, columns=["Importador", "País", "US$", "Participação", "kg", "US$/kg"])
+    fornecedores.to_csv(SAIDA / f"importacao_fornecedores_{ano_ref}.csv", index=False)
+    pd.DataFrame({"chave": ["ano", "paises_pareto", "soma_pareto", "total_mundo"],
+                  "valor": [ano_ref, n_pareto, int(imp_pareto["US$"].sum()), int(total_imp)]}).to_csv(
+        SAIDA / f"importadores_pareto_{ano_ref}.csv", index=False)
 
 if os.environ.get("SO_PLANILHA"):
     sys.exit(0)
@@ -245,7 +252,8 @@ nota = [
                     "Anos recentes podem estar incompletos (países ainda reportando)."],
     ["VCR", "Índice de Balassa: (X do país no SH / X total do país) ÷ (X mundial no SH / X total mundial). "
             "Mundo = soma dos países que reportaram as duas séries no ano. VCR > 1 = vantagem comparativa revelada."],
-    ["Ano de referência", f"{ano_ref} (abas de destinos e fornecedores; é o ano que reproduz a Alemanha da planilha)"],
+    ["Atualização", f"Semanal (GitHub Actions). Anos anteriores a {ANO_FIM - ANOS_RECENTES + 1} ficam em cache; "
+                    f"os {ANOS_RECENTES} mais recentes são baixados de novo a cada 7 dias."],
 ]
 
 arq = SAIDA / f"comtrade_{SH}_series.xlsx"
