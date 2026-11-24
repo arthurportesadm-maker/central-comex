@@ -69,7 +69,10 @@ def comtrade(**params):
     anos_pedidos = [int(a) for a in str(params.get("period", "")).split(",") if a.strip().isdigit()]
     recente = any(a > ANO_FIM - ANOS_RECENTES for a in anos_pedidos)
     if arq.exists() and not (recente and time.time() - arq.stat().st_mtime > 7 * 86400):
-        return pd.read_csv(arq)
+        try:
+            return pd.read_csv(arq)
+        except pd.errors.EmptyDataError:   # ano ainda sem dados no Comtrade
+            return pd.DataFrame()
     df = _baixar(params)
     if not df.empty:
         cols = [c for c in ["reporterCode", "reporterISO", "reporterDesc", "partnerCode", "partnerISO", "partnerDesc",
@@ -119,6 +122,8 @@ def _baixar(params):
 
 
 def valores(df):
+    if df.empty or "reporterCode" not in df:
+        return pd.DataFrame(columns=["reporterCode", "reporter", "partnerCode", "parceiro", "ano", "US$", "kg"])
     out = pd.DataFrame({
         "reporterCode": df["reporterCode"],
         "reporter": [nome_pt(i, d) for i, d in zip(df.get("reporterISO"), df.get("reporterDesc"))],
